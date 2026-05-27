@@ -1,0 +1,50 @@
+name: Daily RSS Fetch
+
+on:
+  schedule:
+    # 每天早上 7:00 UTC = 15:00 北京时间
+    - cron: '0 7 * * *'
+  workflow_dispatch:  # 也可手动触发
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 需要完整历史以提交更新
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Run RSS fetch
+        env:
+          PIPELINE_CONFIG: scripts/config.json
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          cd scripts
+          python rss_fetch_store.py
+
+      - name: Copy DB to data/
+        run: |
+          cp scripts/rss_state.db data/rss_state.db
+
+      - name: Commit and push updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          # 仅在数据库有变化时提交
+          if ! git diff --cached --quiet; then
+            git commit -m "auto: daily RSS update $(date -u +'%Y-%m-%d')"
+            git push
+          else
+            echo "No changes to commit"
+          fi
