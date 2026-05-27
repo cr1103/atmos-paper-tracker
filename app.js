@@ -254,13 +254,22 @@ async function init() {
   const overlay = document.getElementById('db-loading-overlay');
   const progressEl = document.getElementById('db-loading-progress');
 
-  // 阶段1：加载 SQL.js WASM
-  if (progressEl) progressEl.textContent = '正在初始化数据库引擎...';
-  await ensureSqlJs();
-  SQL = await initSqlJs({ locateFile });
+  // 加载超时 = 显示错误信息（不卡死）
+  const timeoutId = setTimeout(() => {
+    if (overlay && !overlay.classList.contains('hidden')) {
+      if (progressEl) progressEl.textContent = '⏳ 加载超时，请检查网络或刷新重试';
+    }
+  }, 25000);
+
+  try {
+    // 阶段1：加载 SQL.js WASM
+    if (progressEl) progressEl.textContent = '正在初始化数据库引擎...';
+    await ensureSqlJs();
+    SQL = await initSqlJs({ locateFile });
+
 
   // 阶段2：下载数据库（带进度）
-  if (progressEl) progressEl.textContent = '正在下载论文数据库（约 15MB）...';
+  if (progressEl) progressEl.textContent = '正在下载论文数据库...';
   const res = await fetch('data/rss_state.db');
   const contentLength = res.headers.get('Content-Length');
   const total = contentLength ? parseInt(contentLength, 10) : 0;
@@ -293,6 +302,7 @@ async function init() {
   db = new SQL.Database(buf);
 
   // 隐藏 loading overlay（带淡出动画）
+  clearTimeout(timeoutId);
   if (overlay) {
     overlay.classList.add('hidden');
     setTimeout(() => overlay.remove(), 400);
@@ -305,6 +315,20 @@ async function init() {
   setupClickTracking();
   window.trackVisits?.();
   runSearch();
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (progressEl) progressEl.textContent = '❌ 加载失败: ' + (e.message || e);
+    if (overlay) {
+      // 显示重试按钮
+      const retryBtn = document.createElement('button');
+      retryBtn.textContent = '刷新重试';
+      retryBtn.className = 'btn-primary-outline';
+      retryBtn.style.marginTop = '16px';
+      retryBtn.onclick = () => location.reload();
+      overlay.querySelector('.db-loading-card')?.appendChild(retryBtn);
+    }
+    console.error('init error:', e);
+  }
 }
 
 // 回到顶部按钮逻辑
