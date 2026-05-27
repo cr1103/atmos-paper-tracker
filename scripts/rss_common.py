@@ -187,7 +187,7 @@ def parse_feed(xml_bytes: bytes) -> List[Dict[str, Any]]:
             pubDate = xml_text(it.find('pubDate')) or xml_text(it.find('dc:date', NS))
             desc = xml_text(it.find('description'))
             add({"title":title,"link":link,"id_like":guid or link,"pub_date":pubDate,
-                 "doi":guess_doi(guid,desc,link),"journal":None})
+                 "doi":guess_doi(guid,desc,link),"journal":None,"abstract":desc})
         return items
 
     # Atom
