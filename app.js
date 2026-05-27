@@ -624,7 +624,6 @@ function openDetail(itemData) {
   linkEl.textContent = '查看原文';
 
   // 精读指令
-  const doi = itemData.doi || '';
   const title = itemData.title_en || itemData.title_cn || '';
   const journal = itemData.journal || '';
   const abstract = itemData.abstract_en || itemData.abstract_cn || '';
