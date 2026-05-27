@@ -764,17 +764,15 @@ function buildWhere() {
   if (df) { clauses.push("(pub_date >= :df)"); params[":df"] = df; }
   if (dt) { clauses.push("(pub_date <= :dt)"); params[":dt"] = dt; }
 
-  // tag：OR - 选中多个 tag 时取并集，只要匹配任意一个即可
+  // tag：AND - 选中多个 tag 时取交集，需要文章同时包含所有选中的 tag
   if (selectedTags.length > 0) {
-    const tagOrClauses = [];
     selectedTags.forEach((t, i) => {
       const kj = `:tgjson${i}`;
       const kp = `:tgplain${i}`;
-      tagOrClauses.push(`(topic_tag LIKE ${kj} OR topic_tag LIKE ${kp})`);
+      clauses.push(`(topic_tag LIKE ${kj} OR topic_tag LIKE ${kp})`);
       params[kj] = `%"${t}"%`;
       params[kp] = `%${t}%`;
     });
-    clauses.push(`(${tagOrClauses.join(' OR ')})`);
   }
 
   // 类型：OR；选 1 个等价于 "="，选多个用 IN (...)

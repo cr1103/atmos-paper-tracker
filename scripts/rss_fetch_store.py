@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from rss_common import (
     db_connect, now_ts, fetch_feed, parse_feed, fetch, extract_article_fields,
-    classify_topic, sha256, TOPICS, ensure_dir, HEADERS, translate_batch_en2zh, log_run
+    classify_topic, classify_topic_heu, sha256, TOPICS, ensure_dir, HEADERS, translate_batch_en2zh, log_run
 )
 
 # -----------------------------
@@ -124,33 +124,151 @@ def _safe_translate(title_en: Optional[str], abstract_en: Optional[str], config:
 
 def classify_topics_multi(title: Optional[str], abstract: Optional[str], config: Dict[str,Any]) -> List[str]:
     """
-    基于现有 classify_topic() 的主标签 + 关键词弱匹配，产出最多 5 个标签。
-    不改动 rss_common 的接口。
+    独立检查每个分类的关键词，标题和摘要中所有匹配的分类都返回。
+    一篇论文可以有多个标签（eg. 标题匹配"雷达"，摘要匹配"云降水"）。
     """
-    text = f"{(title or '')}\n{(abstract or '')}".lower()
-    # 先拿主标签（保持原有逻辑）
-    primary = None
-    try:
-        primary = classify_topic(title or "", abstract, config)
-    except Exception:
-        primary = None
-
+    text_lower = f"{title or ''}\n{abstract or ''}".lower()
+    
+    # 每个分类及其对应的关键词正则（与 classify_topic_heu 保持一致）
+    category_patterns = [
+        ("雷达气象", r"\b("
+            r"radar\s*meteorology|weather\s*radar|cloud\s*radar|"
+            r"polarimetric\s*radar|dual[- ]polarization|dual-pol|"
+            r"ka-band|w-band|mm[- ]wave\s*radar|millimeter[- ]wave\s*radar|"
+            r"doppler\s*spectrum|doppler\s*velocity|spectral\s*breadth|"
+            r"zdr|kdp|differential\s*reflectivity|specific\s*differential\s*phase|"
+            r"radar\s*reflectivity|reflectivity\s*factor|attenuation\s*correction|"
+            r"precipitation\s*radar|profiling\s*radar|cloud\s*profiling|"
+            r"rhi|ppi|radar\s*retrieval|radar\s*observation"
+            r")\b"),
+        ("云降水物理", r"\b("
+            r"cloud\s*microphysics|precipitation\s*microphysics|"
+            r"riming|rimed|aggregation|aggregated|"
+            r"melting\s*layer|bright\s*band|saggy\s*bright\s*band|sbb|"
+            r"supercooled\s*liquid\s*water|slw|"
+            r"ice\s*nucleation|secondary\s*ice\s*production|sip|"
+            r"hallett[- ]mossop|"
+            r"droplet\s*activation|collision[- ]coalescence|warm\s*rain|drizzle|"
+            r"graupel|hail|hydrometeor|"
+            r"particle\s*size\s*distribution|dsd|drop\s*size\s*distribution|"
+            r"rain\s*rate|rainfall|precipitation\s*intensity|"
+            r"liquid\s*water\s*path|lwp|ice\s*water\s*content|iwc|liquid\s*water\s*content|lwc|"
+            r"cloud\s*condensation\s*nuclei|ccn|"
+            r"ice\s*nucleating\s*particles|inp|"
+            r"freezing\s*drizzle|fzra|ice\s*phase|mixed[- ]phase"
+            r")\b"),
+        ("卫星遥感", r"\b("
+            r"satellite\s*remote\s*sensing|satellite\s*retrieval|"
+            r"gpm|cloudsat|calipso|earthcare|"
+            r"passive\s*microwave|microwave\s*radiometer|"
+            r"modis|viirs|avhrr|sentinel|landsat|"
+            r"infrared\s*sounding|microwave\s*sounding|"
+            r"satellite\s*precipitation|satellite\s*cloud|"
+            r"gridded\s*products|imerg|cmorph|"
+            r"spaceborne\s*radar|spaceborne\s*lidar|"
+            r"aerosol\s*optical\s*depth|aod|"
+            r"radiance|brightness\s*temperature|"
+            r"satellite\s*observation|active\s*sensor|passive\s*sensor"
+            r")\b"),
+        ("气溶胶-云相互作用", r"\b("
+            r"aerosol[- ]cloud\s*interaction|aerosol[- ]cloud[- ]radiation|"
+            r"aerosol\s*indirect\s*effect|aerosol\s*direct\s*effect|"
+            r"cloud\s*condensation\s*nuclei|ccn|"
+            r"ice\s*nucleating\s*particles|inp|"
+            r"aerosol\s*radiative\s*effect|aerosol\s*radiative\s*forcing|"
+            r"aerosol\s*activation|aerosol\s*hygroscopicity|"
+            r"twomey\s*effect|albrecht\s*effect|"
+            r"dust\s*aerosol|smoke\s*aerosol|biomass\s*burning|"
+            r"anthropogenic\s*aerosol|sulfate\s*aerosol|"
+            r"aerosol\s*optical\s*depth|aod|"
+            r"aerosol\s*type|aerosol\s*composition|"
+            r"sea\s*salt\s*aerosol|mineral\s*dust|"
+            r"aerosol\s*concentration|particulate\s*matter|pm2\.5|pm10"
+            r")\b"),
+        ("大气动力过程", r"\b("
+            r"atmospheric\s*dynamics|atmospheric\s*circulation|"
+            r"deep\s*convection|shallow\s*convection|convective\s*storm|"
+            r"mesoscale\s*convective\s*system|mcs|squall\s*line|"
+            r"tropical\s*cyclone|hurricane|typhoon|"
+            r"frontal\s*system|cold\s*front|warm\s*front|"
+            r"boundary\s*layer|planetary\s*boundary\s*layer|pbl|"
+            r"turbulence|turbulent\s*kinetic\s*energy|tke|"
+            r"gravity\s*wave|mountain\s*wave|"
+            r"cold\s*pool|outflow|density\s*current|"
+            r"jet\s*stream|polar\s*jet|subtropical\s*jet|"
+            r"atmospheric\s*blocking|blocking\s*high|"
+            r"organized\s*convection|convective\s*organization|"
+            r"atmospheric\s*river|ar|moisture\s*transport|"
+            r"storm\s*track|cyclogenesis|baroclinic|barotropic"
+            r")\b"),
+        ("人工智能+气象", r"\b("
+            r"machine\s*learning|deep\s*learning|neural\s*network|"
+            r"convolutional\s*neural|cnn|transformer|"
+            r"graph\s*neural\s*network|gnn|"
+            r"encoder[- ]decoder|autoencoder|"
+            r"generative\s*model|diffusion\s*model|gan|"
+            r"nowcasting|precipitation\s*nowcasting|"
+            r"weather\s*forecasting|weather\s*prediction|"
+            r"data\s*assimilation|ensemble\s*kalman\s*filter|"
+            r"physics[- ]informed|pinn|"
+            r"supervised\s*learning|unsupervised\s*learning|"
+            r"transfer\s*learning|representation\s*learning|"
+            r"attention\s*mechanism|self-attention|"
+            r"artificial\s*intelligence|ai[- ]based|"
+            r"deepmind|graphcast|pangu|fourcastnet|climatenet|"
+            r"forecast\s*model|weather\s*model|"
+            r"emulation|surrogate\s*model"
+            r")\b"),
+        ("雷达遥感", r"\b("
+            r"synthetic\s*aperture\s*radar|sar|insar|"
+            r"radar\s*remote\s*sensing|radar\s*imaging|"
+            r"ground[- ]penetrating\s*radar|gpr|"
+            r"scatterometer|radar\s*altimeter|"
+            r"interferometric\s*radar|"
+            r"radar\s*backscatter|radar\s*cross[- ]section|"
+            r"radar\s*interferometry|polsar|"
+            r"mm-wave\s*imaging|millimeter[- ]wave\s*imaging"
+            r")\b"),
+        ("激光雷达遥感", r"\b("
+            r"lidar|laser\s*radar|"
+            r"lidar\s*remote\s*sensing|lidar\s*observation|"
+            r"lidar\s*profiling|doppler\s*lidar|"
+            r"raman\s*lidar|rayleigh\s*lidar|"
+            r"mie\s*lidar|differential\s*absorption\s*lidar|dial|"
+            r"wind\s*lidar|aerosol\s*lidar|cloud\s*lidar|"
+            r"lidar\s*retrieval|lidar\s*measurement|"
+            r"lidar\s*ratio|depolarization\s*ratio|"
+            r"high[- ]spectral[- ]resolution\s*lidar|hsrl|"
+            r"ceilometer|micropulse\s*lidar"
+            r")\b"),
+        ("大气遥感探测", r"\b("
+            r"atmospheric\s*remote\s*sensing|atmospheric\s*sounding|"
+            r"remote\s*sensing\s*of\s*atmosphere|"
+            r"atmospheric\s*composition\s*remote|"
+            r"trace\s*gas\s*remote|trace\s*gas\s*retrieval|"
+            r"atmospheric\s*profile\s*retrieval|"
+            r"nadir\s*sounding|limb\s*sounding|"
+            r"occultation|gnss\s*radio\s*occultation|"
+            r"atmospheric\s*column\s*retrieval|"
+            r"total\s*column\s*amount|column\s*density\s*retrieval|"
+            r"hyperspectral\s*sounding|infrared\s*sounder|"
+            r"microwave\s*sounder|microwave\s*radiometer|"
+            r"remote\s*sensing\s*retrieval|"
+            r"aerosol\s*retrieval|aerosol\s*profile|"
+            r"water\s*vapor\s*retrieval|temperature\s*retrieval"
+            r")\b"),
+    ]
+    
+    import re
     tags: List[str] = []
-    if isinstance(primary, str) and primary:
-        tags.append(primary)
-
-    # 依据 TOPICS 做轻量补充（出现即认为相关；可按需改为更严的正则边界）
-    try:
-        candidates = TOPICS or []
-    except Exception:
-        candidates = []
-
-    for t in candidates:
-        if not t or not isinstance(t, str):
-            continue
-        tl = t.lower()
-        if tl in text and t not in tags:
-            tags.append(t)
+    for tag_name, pattern in category_patterns:
+        if re.search(pattern, text_lower):
+            tags.append(tag_name)
+    
+    # 兜底
+    if not tags:
+        tags.append("其他")
+    return tags[:5]
 
     # 最多 5 个，且去重
     return tags[:5]
