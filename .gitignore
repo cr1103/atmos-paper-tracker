@@ -1,0 +1,21 @@
+# Continue
+.continue/
+.claude
+.continue/*
+!.continue/rules
+
+.qodo/
+
+# Runtime metrics database
+data/metrics.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.db-shm
+*.db-wal
+
+# AMS manual RSS files (Cloudflare, can't auto-fetch)
+scripts/ams_feeds/
+import_ams_rss.py

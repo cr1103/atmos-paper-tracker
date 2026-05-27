@@ -1,0 +1,31 @@
+{
+  "feeds": [
+    "https://acp.copernicus.org/xml/rss2_0.xml",
+    "https://amt.copernicus.org/xml/rss2_0.xml",
+    "https://gmd.copernicus.org/xml/rss2_0.xml",
+    "https://essd.copernicus.org/xml/rss2_0.xml",
+    "https://wcd.copernicus.org/xml/rss2_0.xml",
+    "https://nhess.copernicus.org/xml/rss2_0.xml",
+    "https://angeo.copernicus.org/xml/rss2_0.xml",
+    "https://agupubs.onlinelibrary.wiley.com/feed/21698996/most-recent",
+    "https://agupubs.onlinelibrary.wiley.com/feed/19448007/most-recent",
+    "https://rmets.onlinelibrary.wiley.com/feed/1477870x/most-recent",
+    "https://rss.sciencedirect.com/publication/science/00344257",
+    "https://www.nature.com/nature.rss",
+    "https://www.nature.com/nclimate.rss",
+    "https://www.nature.com/ngeo.rss"
+  ],
+  "db": "./rss_state.db",
+  "out_dir": "./reports",
+  "http_timeout": 12,
+  "sleep_between_fetches": 0.2,
+  "max_retries": 1,
+  "max_items_per_feed": 20,
+  "translate_on_ingest": true,
+  "openai": {
+    "api_key": "",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash",
+    "classifier": false
+  }
+}

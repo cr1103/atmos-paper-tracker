@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+rss_common.py — 共享工具/数据库/主题分类/翻译
+"""
+
+from __future__ import annotations
+import os, re, io, json, time, hashlib, sqlite3, html, requests
+from datetime import datetime
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from bs4 import BeautifulSoup
+
+# ---------- TZ ----------
+try:
+    from zoneinfo import ZoneInfo
+    DEFAULT_TZ = ZoneInfo(os.getenv("PIPELINE_TZ", "Asia/Beijing"))
+except Exception:
+    DEFAULT_TZ = None
+
+def now_dt():
+    return datetime.now(DEFAULT_TZ) if DEFAULT_TZ else datetime.now().astimezone()
+
+def now_ts() -> str:
+    return now_dt().isoformat(timespec="seconds")
+
+def ensure_dir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def sha256(b: bytes | str) -> str:
+    if isinstance(b, str):
+        b = b.encode("utf-8", "ignore")
+    return hashlib.sha256(b).hexdigest()
+
+def clean_text(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    s = html.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+HEADERS = {"User-Agent": "rss-nature-extractor/3.0 (+https://example.com)"}
+
+# ---------------- DB schema （统一库 + tag + 运行日志） ----------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS feeds (
+  feed_url TEXT PRIMARY KEY,
+  etag TEXT,
+  last_modified TEXT,
+  last_checked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS seen (
+  uid TEXT PRIMARY KEY,
+  feed_url TEXT NOT NULL,
+  article_url TEXT,
+  doi TEXT,
+  pub_date TEXT,
+  first_seen_at TEXT
+);
+CREATE TABLE IF NOT EXISTS articles (
+  uid TEXT PRIMARY KEY,
+  feed_url TEXT NOT NULL,
+  journal TEXT,
+  title_en TEXT,
+  title_cn TEXT,
+  type TEXT,
+  pub_date TEXT,
+  doi TEXT,
+  article_url TEXT,
+  abstract_en TEXT,
+  abstract_cn TEXT,
+  raw_jsonld TEXT,
+  fetched_at TEXT,
+  last_updated_at TEXT,
+  topic_tag TEXT
+);
+CREATE TABLE IF NOT EXISTS runs_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  script_name TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  status TEXT,
+  notes TEXT,
+  rows_processed INTEGER
+);
+"""
+
+def db_connect(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.executescript(SCHEMA)
+    _ensure_columns(conn)
+    return conn
+
+def _ensure_columns(conn: sqlite3.Connection):
+    # 迁移：若 articles 表缺少列则补上
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(articles)")}
+    need = {
+        "topic_tag": "ALTER TABLE articles ADD COLUMN topic_tag TEXT;",
+        "title_cn": "ALTER TABLE articles ADD COLUMN title_cn TEXT;",
+        "abstract_cn": "ALTER TABLE articles ADD COLUMN abstract_cn TEXT;",
+        "raw_jsonld": "ALTER TABLE articles ADD COLUMN raw_jsonld TEXT;"
+    }
+    for col, sql in need.items():
+        if col not in cols:
+            conn.execute(sql)
+            conn.commit()
+
+# ---------------- HTTP / XML ----------------
+def fetch(url: str, headers: Dict[str, str], timeout: int = 25) -> requests.Response:
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r
+
+def fetch_feed(url: str, etag: Optional[str], last_modified: Optional[str], timeout: int = 25) -> Tuple[int, Dict[str,str], Optional[bytes]]:
+    h = dict(HEADERS)
+    if etag: h["If-None-Match"] = etag
+    if last_modified: h["If-Modified-Since"] = last_modified
+    r = requests.get(url, headers=h, timeout=timeout)
+    if r.status_code == 304:
+        return 304, r.headers, None
+    r.raise_for_status()
+    return r.status_code, r.headers, r.content
+
+def xml_root(xml_bytes: bytes):
+    from xml.etree import ElementTree as ET
+    return ET.fromstring(xml_bytes)
+
+NS = {
+    'rdf': "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    'rss': "http://purl.org/rss/1.0/",
+    'dc': "http://purl.org/dc/elements/1.1/",
+    'content': "http://purl.org/rss/1.0/modules/content/",
+    'prism': "http://prismstandard.org/namespaces/basic/2.0/",
+    'atom': "http://www.w3.org/2005/Atom",
+}
+
+def xml_text(node):
+    return node.text.strip() if (node is not None and node.text) else None
+
+def guess_doi(*cands) -> Optional[str]:
+    for s in cands:
+        if not s: continue
+        m = re.search(r'\b(10\.\d{4,9}/[^\s<>"\']+)', str(s))
+        if m:
+            return m.group(1).rstrip(').,;')
+    return None
+
+def parse_feed(xml_bytes: bytes) -> List[Dict[str, Any]]:
+    root = xml_root(xml_bytes)
+    tag = root.tag.split('}',1)[-1] if '}' in root.tag else root.tag
+    items = []
+
+    def add(d):
+        d["title"] = clean_text(d.get("title"))
+        d["link"] = d.get("link")
+        d["id_like"] = d.get("id_like")
+        d["pub_date"] = clean_text(d.get("pub_date"))
+        d["doi"] = clean_text(d.get("doi"))
+        d["journal"] = clean_text(d.get("journal"))
+        items.append(d)
+
+    # RSS1.0
+    if tag == "RDF" or root.find('rss:channel', NS) is not None:
+        for it in root.findall('rss:item', NS):
+            title = xml_text(it.find('rss:title', NS)) or xml_text(it.find('dc:title', NS))
+            link = xml_text(it.find('rss:link', NS))
+            about = it.get(f'{{{NS["rdf"]}}}about')
+            dc_date = xml_text(it.find('dc:date', NS))
+            prism_doi = xml_text(it.find('prism:doi', NS))
+            prism_pub = xml_text(it.find('prism:publicationName', NS))
+            dc_ident = xml_text(it.find('dc:identifier', NS))
+            add({"title":title,"link":link,"id_like":about or dc_ident or link,
+                 "pub_date":dc_date,"doi":prism_doi or guess_doi(dc_ident,link),
+                 "journal":prism_pub})
+        return items
+
+    # RSS2.0
+    if tag == "rss" or root.find('channel') is not None:
+        ch = root.find('channel')
+        for it in (ch.findall('item') if ch is not None else []):
+            title = xml_text(it.find('title')) or xml_text(it.find('dc:title', NS))
+            link = xml_text(it.find('link'))
+            guid = xml_text(it.find('guid'))
+            pubDate = xml_text(it.find('pubDate')) or xml_text(it.find('dc:date', NS))
+            desc = xml_text(it.find('description'))
+            add({"title":title,"link":link,"id_like":guid or link,"pub_date":pubDate,
+                 "doi":guess_doi(guid,desc,link),"journal":None})
+        return items
+
+    # Atom
+    if tag == "feed" or root.find('atom:feed', NS) is not None:
+        feed = root
+        for entry in feed.findall('atom:entry', NS) or feed.findall('entry'):
+            title = xml_text(entry.find('atom:title', NS)) or xml_text(entry.find('title'))
+            link_el = entry.find('atom:link[@rel=\"alternate\"]', NS) or entry.find('link')
+            link = link_el.get('href') if link_el is not None else None
+            entry_id = xml_text(entry.find('atom:id', NS)) or xml_text(entry.find('id'))
+            published = xml_text(entry.find('atom:published', NS)) or xml_text(entry.find('published'))
+            updated = xml_text(entry.find('atom:updated', NS)) or xml_text(entry.find('updated'))
+            add({"title":title,"link":link,"id_like":entry_id or link,"pub_date":published or updated,
+                 "doi":guess_doi(entry_id,link),"journal":None})
+        return items
+    return items
+
+# --------------- 文章页面解析 ---------------
+def soupify(html_text: str) -> BeautifulSoup:
+    return BeautifulSoup(html_text, "lxml")
+
+def parse_jsonld(soup: BeautifulSoup) -> List[dict]:
+    out=[]
+    for tag in soup.find_all("script", attrs={"type":"application/ld+json"}):
+        try:
+            data=json.loads(tag.string or "")
+        except Exception:
+            continue
+        if isinstance(data, list): out.extend(data)
+        elif isinstance(data, dict): out.append(data)
+    return out
+
+def pick_article_obj(jsonlds: List[dict]) -> Optional[dict]:
+    for obj in jsonlds:
+        t = obj.get("@type") or obj.get("type")
+        if isinstance(t, list): t = t[0]
+        if t in ("Article","ScholarlyArticle","NewsArticle"):
+            return obj
+    return None
+
+def extract_from_jsonld(obj: dict) -> Dict[str, Optional[str]]:
+    if not obj: return {}
+    def _getid(v):
+        if isinstance(v, dict):
+            return v.get("value") or v.get("@id")
+        return v
+    title = obj.get("headline") or obj.get("name")
+    abstract = obj.get("abstract") or obj.get("description")
+    date_published = obj.get("datePublished") or obj.get("dateCreated")
+    journal = None
+    atype = obj.get("articleSection") or obj.get("type")
+    doi = None
+    ident = obj.get("identifier")
+    if isinstance(ident, list):
+        for it in ident:
+            s=_getid(it)
+            if s and "10." in s:
+                m=re.search(r'10\.\d{4,9}/\S+', s)
+                if m: doi=m.group(0); break
+    elif isinstance(ident, str) and "10." in ident:
+        m=re.search(r'10\.\d{4,9}/\S+', ident)
+        if m: doi=m.group(0)
+    ispart = obj.get("isPartOf")
+    if isinstance(ispart, dict):
+        journal = ispart.get("name")
+    publisher = obj.get("publisher")
+    if isinstance(publisher, dict):
+        journal = journal or publisher.get("name")
+    return {
+        "title": clean_text(title),
+        "abstract": clean_text(abstract),
+        "date_published": clean_text(date_published),
+        "journal": clean_text(journal),
+        "type": clean_text(atype),
+        "doi": clean_text(doi),
+    }
+
+ABSTRACT_HINTS = [
+    {"css": 'section[id*="abstract"], div[id*="abstract"], article[id*="abstract"]'},
+    {"css": 'section[class*="abstract"], div[class*="abstract"], article[class*="abstract"]'},
+    {"css": 'div#Abs1-content, div#Abs1, div#Abs1-section'},
+    {"css": 'section#abstract, div#abstract, section.abstract, div.abstract'},
+    {"css": 'div.Citation__abstract, div.article__abstract'},
+    {"css": 'section.ArticleBody_abstract, section.Abstract'},
+]
+
+def _first_text_by_selectors(soup: BeautifulSoup, selectors: list[str]) -> Optional[str]:
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            txt = clean_text(el.get_text(" "))
+            if txt and len(txt) > 40:
+                return txt
+    return None
+
+def _meta(soup: BeautifulSoup, name: str) -> Optional[str]:
+    tag = soup.find("meta", attrs={"name": name})
+    if tag and tag.get("content"):
+        return clean_text(tag["content"])
+    return None
+
+def extract_article_fields(html_text: str, url: str) -> Dict[str, Optional[str]]:
+    # --- Nature 专用解析优先 ---
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        host = ""
+    if host.endswith("nature.com"):
+        rec = _extract_nature_fields(html_text, url)
+        if rec:  # 命中就直接返回
+            return rec
+    soup = soupify(html_text)
+    jsonlds = parse_jsonld(soup)
+    jsonld_obj = pick_article_obj(jsonlds)
+    base = extract_from_jsonld(jsonld_obj) if jsonld_obj else {}
+    # 兜底
+    base.setdefault("journal", _meta(soup, "citation_journal_title"))
+    base.setdefault("title", _meta(soup, "citation_title"))
+    base.setdefault("doi", _meta(soup, "citation_doi"))
+    base.setdefault("date_published", _meta(soup, "citation_publication_date"))
+    base.setdefault("type", _meta(soup, "citation_article_type"))
+
+    # 摘要优先级
+    abstract = base.get("abstract")
+    if not abstract:
+        abstract = _meta(soup, "dc.description") or _meta(soup, "description")
+    if not abstract:
+        abstract = _first_text_by_selectors(soup, [h["css"] for h in ABSTRACT_HINTS])
+    if not abstract:
+        og = soup.find("meta", attrs={"property": "og:description"})
+        if og and og.get("content"):
+            abstract = clean_text(og["content"])
+    if not abstract:
+        tw = soup.find("meta", attrs={"name": "twitter:description"})
+        if tw and tw.get("content"):
+            abstract = clean_text(tw["content"])
+
+    base["abstract"] = abstract
+    base["article_url"] = url
+    # 将所有 JSON-LD 原样保存（字符串）
+    try:
+        base["raw_jsonld"] = json.dumps(jsonlds, ensure_ascii=False)
+    except Exception:
+        base["raw_jsonld"] = None
+    return base
+
+# ---------------- OpenAI（可选） ----------------
+def _openai_chat(messages: List[Dict[str,str]], cfg: Dict[str,Any]) -> Optional[str]:
+    ocfg = (cfg.get("openai") or {})
+    api_key = ocfg.get("api_key"); base_url = (ocfg.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+    model = ocfg.get("model") or "gpt-4o-mini"
+    if not api_key: return None
+    url = f"{base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "temperature": 0.2}
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=cfg.get("http_timeout",60))
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+# 批量英->中翻译（可选）
+def translate_batch_en2zh(texts: List[str], cfg: Dict[str,Any]) -> List[Optional[str]]:
+    ocfg = cfg.get("openai") or {}
+    if not ocfg.get("api_key"):
+        return [None if t else None for t in texts]
+    out=[]
+    for t in texts:
+        if not t:
+            out.append(None)
+            continue
+        msg = [
+            {"role":"system","content":"You are a precise EN->ZH translator. Return only the translation in Simplified Chinese, no extra text."},
+            {"role":"user","content":f"请将以下英文准确翻译为简体中文：\n\n{t}"}
+        ]
+        zh = _openai_chat(msg, cfg)
+        out.append(zh or None)
+    return out
+
+# ---------------- 主题分类 ----------------
+TOPICS = ["雷达气象","云降水物理","卫星遥感","气溶胶-云相互作用","大气动力过程","人工智能+气象","雷达遥感","激光雷达遥感","大气遥感探测","其他"]
+
+def classify_topic_heu(text: str) -> str:
+    t = text.lower()
+
+    # ---- 雷达气象 ----
+    if re.search(
+        r"\b("
+        r"radar\s*meteorology|weather\s*radar|cloud\s*radar|"
+        r"polarimetric\s*radar|dual[- ]polarization|dual-pol|"
+        r"ka-band|w-band|mm[- ]wave\s*radar|millimeter[- ]wave\s*radar|"
+        r"doppler\s*spectrum|doppler\s*velocity|spectral\s*breadth|"
+        r"zdr|kdp|differential\s*reflectivity|specific\s*differential\s*phase|"
+        r"radar\s*reflectivity|reflectivity\s*factor|attenuation\s*correction|"
+        r"precipitation\s*radar|profiling\s*radar|cloud\s*profiling|"
+        r"rhi|ppi|radar\s*retrieval|radar\s*observation"
+        r")\b",
+        t,
+    ):
+        return "雷达气象"
+
+    # ---- 云降水物理 ----
+    if re.search(
+        r"\b("
+        r"cloud\s*microphysics|precipitation\s*microphysics|"
+        r"riming|rimed|aggregation|aggregated|"
+        r"melting\s*layer|bright\s*band|saggy\s*bright\s*band|sbb|"
+        r"supercooled\s*liquid\s*water|slw|"
+        r"ice\s*nucleation|secondary\s*ice\s*production|sip|"
+        r"hallett[- ]mossop|"
+        r"droplet\s*activation|collision[- ]coalescence|warm\s*rain|drizzle|"
+        r"graupel|hail|hydrometeor|"
+        r"particle\s*size\s*distribution|dsd|drop\s*size\s*distribution|"
+        r"rain\s*rate|rainfall|precipitation\s*intensity|"
+        r"liquid\s*water\s*path|lwp|ice\s*water\s*content|iwc|liquid\s*water\s*content|lwc|"
+        r"cloud\s*condensation\s*nuclei|ccn|"
+        r"ice\s*nucleating\s*particles|inp|"
+        r"freezing\s*drizzle|fzra|ice\s*phase|mixed[- ]phase"
+        r")\b",
+        t,
+    ):
+        return "云降水物理"
+
+    # ---- 卫星遥感 ----
+    if re.search(
+        r"\b("
+        r"satellite\s*remote\s*sensing|satellite\s*retrieval|"
+        r"gpm|cloudsat|calipso|earthcare|"
+        r"passive\s*microwave|microwave\s*radiometer|"
+        r"modis|viirs|avhrr|sentinel|landsat|"
+        r"infrared\s*sounding|microwave\s*sounding|"
+        r"satellite\s*precipitation|satellite\s*cloud|"
+        r"gridded\s*products|imerg|cmorph|"
+        r"spaceborne\s*radar|spaceborne\s*lidar|"
+        r"aerosol\s*optical\s*depth|aod|"
+        r"radiance|brightness\s*temperature|"
+        r"satellite\s*observation|active\s*sensor|passive\s*sensor"
+        r")\b",
+        t,
+    ):
+        return "卫星遥感"
+
+    # ---- 气溶胶-云相互作用 ----
+    if re.search(
+        r"\b("
+        r"aerosol[- ]cloud\s*interaction|aerosol[- ]cloud[- ]radiation|"
+        r"aerosol\s*indirect\s*effect|aerosol\s*direct\s*effect|"
+        r"cloud\s*condensation\s*nuclei|ccn|"
+        r"ice\s*nucleating\s*particles|inp|"
+        r"aerosol\s*radiative\s*effect|aerosol\s*radiative\s*forcing|"
+        r"aerosol\s*activation|aerosol\s*hygroscopicity|"
+        r"twomey\s*effect|albrecht\s*effect|"
+        r"dust\s*aerosol|smoke\s*aerosol|biomass\s*burning|"
+        r"anthropogenic\s*aerosol|sulfate\s*aerosol|"
+        r"aerosol\s*optical\s*depth|aod|"
+        r"aerosol\s*type|aerosol\s*composition|"
+        r"sea\s*salt\s*aerosol|mineral\s*dust|"
+        r"aerosol\s*concentration|particulate\s*matter|pm2\.5|pm10"
+        r")\b",
+        t,
+    ):
+        return "气溶胶-云相互作用"
+
+    # ---- 大气动力过程 ----
+    if re.search(
+        r"\b("
+        r"atmospheric\s*dynamics|atmospheric\s*circulation|"
+        r"deep\s*convection|shallow\s*convection|convective\s*storm|"
+        r"mesoscale\s*convective\s*system|mcs|squall\s*line|"
+        r"tropical\s*cyclone|hurricane|typhoon|"
+        r"frontal\s*system|cold\s*front|warm\s*front|"
+        r"boundary\s*layer|planetary\s*boundary\s*layer|pbl|"
+        r"turbulence|turbulent\s*kinetic\s*energy|tke|"
+        r"gravity\s*wave|mountain\s*wave|"
+        r"cold\s*pool|outflow|density\s*current|"
+        r"jet\s*stream|polar\s*jet|subtropical\s*jet|"
+        r"atmospheric\s*blocking|blocking\s*high|"
+        r"organized\s*convection|convective\s*organization|"
+        r"atmospheric\s*river|ar|moisture\s*transport|"
+        r"storm\s*track|cyclogenesis|baroclinic|barotropic"
+        r")\b",
+        t,
+    ):
+        return "大气动力过程"
+
+    # ---- 人工智能+气象 ----
+    if re.search(
+        r"\b("
+        r"machine\s*learning|deep\s*learning|neural\s*network|"
+        r"convolutional\s*neural|cnn|transformer|"
+        r"graph\s*neural\s*network|gnn|"
+        r"encoder[- ]decoder|autoencoder|"
+        r"generative\s*model|diffusion\s*model|gan|"
+        r"nowcasting|precipitation\s*nowcasting|"
+        r"weather\s*forecasting|weather\s*prediction|"
+        r"data\s*assimilation|ensemble\s*kalman\s*filter|"
+        r"physics[- ]informed|pinn|"
+        r"supervised\s*learning|unsupervised\s*learning|"
+        r"transfer\s*learning|representation\s*learning|"
+        r"attention\s*mechanism|self-attention|"
+        r"artificial\s*intelligence|ai[- ]based|"
+        r"deepmind|graphcast|pangu|fourcastnet|climatenet|"
+        r"forecast\s*model|weather\s*model|"
+        r"emulation|surrogate\s*model"
+        r")\b",
+        t,
+    ):
+        return "人工智能+气象"
+
+    # ---- 雷达遥感 ----
+    if re.search(
+        r"\b("
+        r"synthetic\s*aperture\s*radar|sar|insar|"
+        r"radar\s*remote\s*sensing|radar\s*imaging|"
+        r"ground[- ]penetrating\s*radar|gpr|"
+        r"scatterometer|radar\s*altimeter|"
+        r"interferometric\s*radar|"
+        r"radar\s*backscatter|radar\s*cross[- ]section|"
+        r"radar\s*interferometry|polsar|"
+        r"mm-wave\s*imaging|millimeter[- ]wave\s*imaging"
+        r")\b",
+        t,
+    ):
+        return "雷达遥感"
+
+    # ---- 激光雷达遥感 ----
+    if re.search(
+        r"\b("
+        r"lidar|laser\s*radar|"
+        r"lidar\s*remote\s*sensing|lidar\s*observation|"
+        r"lidar\s*profiling|doppler\s*lidar|"
+        r"raman\s*lidar|rayleigh\s*lidar|"
+        r"mie\s*lidar|differential\s*absorption\s*lidar|dial|"
+        r"wind\s*lidar|aerosol\s*lidar|cloud\s*lidar|"
+        r"lidar\s*retrieval|lidar\s*measurement|"
+        r"lidar\s*ratio|depolarization\s*ratio|"
+        r"high[- ]spectral[- ]resolution\s*lidar|hsrl|"
+        r"ceilometer|micropulse\s*lidar"
+        r")\b",
+        t,
+    ):
+        return "激光雷达遥感"
+
+    # ---- 大气遥感探测 ----
+    if re.search(
+        r"\b("
+        r"atmospheric\s*remote\s*sensing|atmospheric\s*sounding|"
+        r"remote\s*sensing\s*of\s*atmosphere|"
+        r"atmospheric\s*composition\s*remote|"
+        r"trace\s*gas\s*remote|trace\s*gas\s*retrieval|"
+        r"atmospheric\s*profile\s*retrieval|"
+        r"nadir\s*sounding|limb\s*sounding|"
+        r"occultation|gnss\s*radio\s*occultation|"
+        r"atmospheric\s*column\s*retrieval|"
+        r"total\s*column\s*amount|column\s*density\s*retrieval|"
+        r"hyperspectral\s*sounding|infrared\s*sounder|"
+        r"microwave\s*sounder|microwave\s*radiometer|"
+        r"remote\s*sensing\s*retrieval|"
+        r"aerosol\s*retrieval|aerosol\s*profile|"
+        r"water\s*vapor\s*retrieval|temperature\s*retrieval"
+        r")\b",
+        t,
+    ):
+        return "大气遥感探测"
+
+    return "其他"
+
+
+def classify_topic(title: str, abstract: Optional[str], cfg: Dict[str,Any]) -> str:
+    ocfg = (cfg.get("openai") or {})
+    if ocfg.get("classifier", False) and ocfg.get("api_key"):
+        prompt = (
+            "请把下面论文按主题打一个且仅一个标签，候选集合："
+            "['雷达气象','云降水物理','卫星遥感','气溶胶-云相互作用','大气动力过程','人工智能+气象','其他']。"
+            "只输出标签本身，不要解释。\n"
+            f"标题：{title}\n摘要：{abstract or ''}"
+        )
+        out = _openai_chat(
+            [{"role":"system","content":"You are a precise tagger."},
+             {"role":"user","content":prompt}], cfg)
+        if out:
+            out = out.strip().replace("'", "").replace(" ", "")
+            for k in TOPICS:
+                if k in out:
+                    return k
+    return classify_topic_heu(f"{title}\n{abstract or ''}")
+
+# ---------------- 日志 ----------------
+def log_run(conn: sqlite3.Connection, script_name: str, started_at: str, status: str, rows: int, notes: str=""):
+    conn.execute(
+        "INSERT INTO runs_log(script_name, started_at, finished_at, status, notes, rows_processed) VALUES (?,?,?,?,?,?)",
+        (script_name, started_at, now_ts(), status, notes, rows)
+    )
+    conn.commit()
+
+
+def parse_topic_tags(v: Optional[str]) -> List[str]:
+    if not v: return []
+    try:
+        x = json.loads(v)
+        return x if isinstance(x, list) else [str(v)]
+    except Exception:
+        return [v]
+    
+
+# --- add imports if missing ---
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup  # 确保已安装 bs4
+import json as _json
+import re as _re
+
+_MONTHS = {
+    'january':'01','february':'02','march':'03','april':'04','may':'05','june':'06',
+    'july':'07','august':'08','september':'09','october':'10','november':'11','december':'12'
+}
+
+def _parse_date_human(s: str) -> str | None:
+    """
+    将 '19 August 2025' / '29 August 2025' 这类日期转为 '2025-08-19'
+    """
+    if not s: return None
+    m = _re.search(r'(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})', s)
+    if not m: return None
+    d, mon, y = m.group(1), m.group(2).lower(), m.group(3)
+    mm = _MONTHS.get(mon)
+    if not mm: return None
+    return f"{y}-{mm}-{int(d):02d}"
+
+def _first_text(el):
+    return (el.get_text(" ", strip=True) if el else "").strip() or None
+
+def _get_meta(soup, *names, prop=False):
+    """
+    取 meta[name=...] 或 meta[property=...] 的 content
+    """
+    for n in names:
+        tag = soup.find("meta", attrs={("property" if prop else "name"): n})
+        if tag and tag.get("content"): return tag["content"].strip()
+    return None
+
+def _extract_jsonld_candidates(soup: BeautifulSoup) -> list[dict]:
+    """
+    解析 <script type="application/ld+json">，返回 dict 列表
+    """
+    out = []
+    for sc in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = _json.loads(sc.string or sc.text or "")
+            if isinstance(data, list):
+                out.extend([x for x in data if isinstance(x, dict)])
+            elif isinstance(data, dict):
+                out.append(data)
+        except Exception:
+            continue
+    return out
+
+def _jsonld_pick_article(objs: list[dict]) -> dict | None:
+    """
+    从 JSON-LD 里挑 ScholarlyArticle/NewsArticle/Article
+    """
+    for o in objs:
+        t = (o.get("@type") or o.get("type") or "")
+        if isinstance(t, list):
+            tset = {str(x).lower() for x in t}
+        else:
+            tset = {str(t).lower()}
+        if tset & {"scholarlyarticle","newsarticle","article","blogposting","reviewarticle"}:
+            return o
+    return None
+
+def _jsonld_get(o: dict, *paths) -> str | None:
+    """
+    从 JSON-LD 对象里走多路径拿值；例如 ("isPartOf","name") 或 ("journal","name")
+    """
+    for p in paths:
+        cur = o
+        ok = True
+        for key in p if isinstance(p, (list,tuple)) else (p,):
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            else:
+                ok = False; break
+        if ok and isinstance(cur, (str,int,float)):
+            return str(cur).strip()
+    return None
+
+
+# —— 可调：类型显式映射（小写键 -> 规范值）——
+NATURE_TYPE_MAP = {
+    "article": "Article",
+    "research article": "Article",
+    "review article": "Review",
+    "review": "Review",
+    "brief communication": "Brief Communication",
+    "letter": "Letter",
+    "analysis": "Analysis",
+    "perspective": "Perspective",
+    "correspondence": "Correspondence",
+    "editorial": "Editorial",
+    "comment": "Comment",
+    "news": "News",
+    "news & views": "News & Views",
+    "research highlight": "Research Highlight",
+    "careers": "Careers",
+}
+
+
+def _extract_nature_fields(html: str, url: str) -> dict | None:
+    """
+    严格版：仅针对 Nature 主站/子刊详情页。
+    - 不读取 JSON-LD，不做广义兜底。
+    - 仅使用 citation_* meta、breadcrumb、publication-history <time datetime>。
+    返回字段：
+      title, abstract, journal, type, date_published, doi, article_url, raw_jsonld(None)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- 小工具：取 meta 内容 ---
+    def _get_meta(name: str, prop: bool = False) -> str | None:
+        if prop:
+            tag = soup.find("meta", attrs={"property": name})
+        else:
+            tag = soup.find("meta", attrs={"name": name})
+        if tag and tag.get("content"):
+            s = tag["content"].strip()
+            return s or None
+        return None
+
+    # --- 小工具：取文本 ---
+    def _text_of(elem) -> str | None:
+        if not elem:
+            return None
+        txt = elem.get_text(" ", strip=True)
+        return txt or None
+
+    # --- 标题 ---
+    h1 = soup.find("h1", attrs={"data-test": _re.compile(r"article-title", _re.I)}) \
+         or soup.find("h1", class_=_re.compile(r"\bc-article-title\b"))
+    title = _text_of(h1) or _get_meta("citation_title") or _get_meta("dc.title")
+
+    # --- 摘要（优先 meta；特殊值“Letter to the Editor”时转为正文首段）---
+    abstract = None
+    meta_abs = _get_meta("dc.description") or _get_meta("description")
+    if meta_abs and meta_abs.strip().casefold() == "letter to the editor":
+        # 从正文容器抓第一个段落
+        main = soup.find(
+            "div",
+            class_=_re.compile(r"\bc-article-body\b.*\bmain-content\b", _re.I),
+            attrs={"data-test": _re.compile(r"^main-content$", _re.I)},
+        ) or soup.select_one("div.c-article-body.main-content[data-test='main-content']")
+        if main:
+            p = main.find("p")
+            abstract = _text_of(p)
+    else:
+        abstract = meta_abs
+
+    # 若还没有摘要，退回到 section 摘要区块
+    if not abstract:
+        abs_section = soup.find("section", id=_re.compile(r"^Abs\d+", _re.I)) \
+                    or soup.find("section", attrs={"data-title": _re.compile(r"abstract", _re.I)})
+        if abs_section:
+            p = abs_section.find("p")
+            abstract = _text_of(p)
+
+    # 再退回 teaser 首段
+    if not abstract:
+        teaser = soup.find("div", class_=_re.compile(r"\barticle__teaser\b"))
+        if teaser:
+            p = teaser.find("p")
+            abstract = _text_of(p)
+
+    # --- 期刊 ---
+    journal = _get_meta("citation_journal_title") or _get_meta("prism.publicationName")
+    if not journal:
+        crumb = soup.find(lambda t: t.name in ("ol", "nav") and
+                          t.get("aria-label") and _re.search(r"breadcrumb", t.get("aria-label"), _re.I))
+        if crumb:
+            links = [a.get_text(" ", strip=True) for a in crumb.find_all("a")]
+            if len(links) >= 2:
+                cand = (links[1] or "").strip()
+                journal = cand or None
+
+    # --- DOI ---
+    doi = _get_meta("citation_doi")
+    if not doi:
+        ident = _get_meta("dc.identifier")
+        if ident and _re.search(r"\b10\.\d{4,9}/\S+\b", ident):
+            doi = ident
+    if doi:
+        d = doi.strip()
+        if d.lower().startswith("doi:"):
+            d = d[4:].strip()
+        if d.lower().startswith("https://doi.org/"):
+            d = d[len("https://doi.org/"):].strip()
+        doi = d or None
+
+    # --- 出版日期 ---
+    date_published = None
+    hist_list = soup.find("ul", attrs={"data-test": _re.compile(r"publication-history", _re.I)})
+    if hist_list:
+        for li in hist_list.find_all("li"):
+            txt = _text_of(li)
+            if txt and _re.search(r"\bPublished\b", txt, _re.I):
+                t = li.find("time", attrs={"datetime": True})
+                if t and t.get("datetime"):
+                    iso = t["datetime"].strip()
+                    if len(iso) >= 10 and _re.match(r"^\d{4}-\d{2}-\d{2}$", iso[:10]):
+                        date_published = iso[:10]
+                        break
+    if not date_published:
+        cod = _get_meta("citation_online_date")
+        if cod and len(cod) >= 10 and _re.match(r"^\d{4}-\d{2}-\d{2}$", cod[:10]):
+            date_published = cod[:10]
+
+    # --- 类型（仅 citation_article_type）---
+    type_raw = _get_meta("citation_article_type")
+    type_final = type_raw.strip() if type_raw else None
+
+    rec = {
+        "title": title,
+        "abstract": abstract,
+        "journal": journal,
+        "type": type_final,
+        "date_published": date_published,
+        "doi": doi,
+        "article_url": url,
+        "raw_jsonld": None,
+    }
+
+    core_ok = bool(rec["title"] or rec["doi"] or (rec["journal"] and rec["date_published"]))
+    return rec if core_ok else None
+
+
+# headers={"User-Agent": "rss-nature-extractor/3.0 (+https://example.com)"}
+# r = requests.get(url='https://www.nature.com/articles/d41586-025-02795-1', headers=headers)
+# with open("page.html", "w", encoding="utf-8") as f:
+#     f.write(r.text)
