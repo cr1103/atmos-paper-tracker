@@ -26,13 +26,17 @@ function updateBilingualButton() {
 function locateFile(file) { return './' + file; }
 async function ensureSqlJs() {
   if (typeof initSqlJs === 'function') return;
-  await new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.js';
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error('fallback CDN sql.js 加载失败'));
-    document.head.appendChild(s);
-  });
+  // CDN fallback with timeout（国内可能被墙）
+  await Promise.race([
+    new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.js';
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('fallback CDN sql.js 加载失败'));
+      document.head.appendChild(s);
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('CDN 加载超时（可能被网络限制）')), 8000))
+  ]);
   if (typeof initSqlJs !== 'function') {
     throw new Error('initSqlJs 未定义，请确认 sql-wasm.js/sql-wasm.wasm 放在站点根目录或网络可达');
   }
