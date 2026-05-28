@@ -149,6 +149,10 @@ def guess_doi(*cands) -> Optional[str]:
     return None
 
 def parse_feed(xml_bytes: bytes) -> List[Dict[str, Any]]:
+    # 修复部分 Copernicus RSS 中 `&` 未转义的问题
+    xml_str = xml_bytes.decode('utf-8', errors='replace')
+    xml_str = re.sub(r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)', '&amp;', xml_str)
+    xml_bytes = xml_str.encode('utf-8')
     root = xml_root(xml_bytes)
     tag = root.tag.split('}',1)[-1] if '}' in root.tag else root.tag
     items = []
